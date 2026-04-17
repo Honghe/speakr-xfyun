@@ -178,31 +178,35 @@ class XFYunClient:
         return data["data"]["url"]
 
     def upload_multipart_init(self, path: Path, request_id: str) -> Dict[str, Any]:
+        # The multipart upload APIs use top-level params, unlike task creation/query.
         payload = {
-            "common": {"app_id": self.app_id},
-            "business": {"request_id": request_id, "file_size": path.stat().st_size},
+            "request_id": request_id,
+            "app_id": self.app_id,
         }
         return self._post_json(f"{UPLOAD_BASE}/file/mpupload/init", payload)
 
-    def upload_multipart_part(self, task_id: str, upload_id: str, slice_id: int, chunk_bytes: bytes) -> Dict[str, Any]:
+    def upload_multipart_part(
+        self, request_id: str, upload_id: str, slice_id: int, chunk_bytes: bytes
+    ) -> Dict[str, Any]:
         fields = {
-            "task_id": task_id,
+            "request_id": request_id,
+            "app_id": self.app_id,
             "upload_id": upload_id,
             "slice_id": str(slice_id),
-            "content": (f"slice_{slice_id}.part", chunk_bytes, "application/octet-stream"),
+            "data": (f"slice_{slice_id}.part", chunk_bytes, "application/octet-stream"),
         }
         return self._post_multipart(f"{UPLOAD_BASE}/file/mpupload/upload", fields)
 
-    def upload_multipart_complete(self, task_id: str, upload_id: str) -> Dict[str, Any]:
+    def upload_multipart_complete(self, request_id: str, upload_id: str) -> Dict[str, Any]:
         payload = {
-            "common": {"app_id": self.app_id},
-            "business": {"task_id": task_id, "upload_id": upload_id},
+            "request_id": request_id,
+            "app_id": self.app_id,
+            "upload_id": upload_id,
         }
         return self._post_json(f"{UPLOAD_BASE}/file/mpupload/complete", payload)
 
     def upload_large_file(self, path: Path, request_id: str) -> str:
         init_data = self.upload_multipart_init(path, request_id)
-        task_id = init_data["data"]["task_id"]
         upload_id = init_data["data"]["upload_id"]
 
         with path.open("rb") as f:
@@ -212,10 +216,10 @@ class XFYunClient:
                 if not chunk:
                     break
                 logger.info("Uploading multipart chunk %s (%s bytes)", slice_id, len(chunk))
-                self.upload_multipart_part(task_id, upload_id, slice_id, chunk)
+                self.upload_multipart_part(request_id, upload_id, slice_id, chunk)
                 slice_id += 1
 
-        complete_data = self.upload_multipart_complete(task_id, upload_id)
+        complete_data = self.upload_multipart_complete(request_id, upload_id)
         return complete_data["data"]["url"]
 
     def create_task(
