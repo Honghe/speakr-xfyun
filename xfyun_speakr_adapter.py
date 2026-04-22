@@ -73,6 +73,7 @@ POLL_INTERVAL_SECONDS = float(os.getenv("XF_POLL_INTERVAL_SECONDS", "5"))
 POLL_TIMEOUT_SECONDS = int(os.getenv("XF_POLL_TIMEOUT_SECONDS", "7200"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("XF_REQUEST_TIMEOUT_SECONDS", "300"))
 DELETE_TEMP_FILE = os.getenv("DELETE_TEMP_FILE", "true").lower() == "true"
+NORMALIZE_AUDIO_BEFORE_UPLOAD = os.getenv("NORMALIZE_AUDIO_BEFORE_UPLOAD", "true").lower() == "true"
 POSTPROC_ON = int(os.getenv("XF_POSTPROC_ON", "1"))
 OUTPUT_TYPE = int(os.getenv("XF_OUTPUT_TYPE", "0"))
 ENABLE_SUBTITLE = int(os.getenv("XF_ENABLE_SUBTITLE", "0"))
@@ -552,6 +553,45 @@ def validate_audio_for_xfyun(path: Path, probe: Optional[AudioProbe]) -> None:
     )
 
 
+def transcode_audio_for_xfyun(source_path: Path) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise XFYunAPIError(
+            "ffmpeg not found; cannot normalize audio to XFYun-required wav/16k/mono/pcm_s16le",
+            status_code=500,
+        )
+
+    target_path = source_path.with_name(f"{source_path.stem}-xfyun.wav")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(target_path),
+    ]
+    logger.info("Normalizing audio for XFYun source=%s target=%s", source_path.name, target_path.name)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+    except subprocess.TimeoutExpired as exc:
+        raise XFYunAPIError(
+            f"ffmpeg timed out while normalizing audio {source_path.name}",
+            status_code=500,
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise XFYunAPIError(
+            f"ffmpeg failed while normalizing audio {source_path.name}: {stderr[:500] or exc}",
+            status_code=422,
+        ) from exc
+    return target_path
+
+
 xf_client = XFYunClient(XF_APPID, XF_API_KEY, XF_API_SECRET)
 
 
@@ -575,16 +615,27 @@ async def asr(
     diarize_flag = enable_diarization if enable_diarization is not None else diarize
 
     tmp_path: Optional[Path] = None
+    upload_path: Optional[Path] = None
     request_id = uuid.uuid4().hex
     try:
         tmp_path = save_upload_to_tmp(audio_file)
-        probe = probe_audio(tmp_path)
-        log_audio_probe(tmp_path, probe)
-        validate_audio_for_xfyun(tmp_path, probe)
-        file_size = tmp_path.stat().st_size
+        source_probe = probe_audio(tmp_path)
+        log_audio_probe(tmp_path, source_probe)
+
+        upload_path = tmp_path
+        if NORMALIZE_AUDIO_BEFORE_UPLOAD:
+            upload_path = transcode_audio_for_xfyun(tmp_path)
+            normalized_probe = probe_audio(upload_path)
+            log_audio_probe(upload_path, normalized_probe)
+            validate_audio_for_xfyun(upload_path, normalized_probe)
+        else:
+            validate_audio_for_xfyun(upload_path, source_probe)
+
+        file_size = upload_path.stat().st_size
         logger.info(
-            "Received ASR request file=%s size=%s language=%s diarize=%s prompt=%s hotwords=%s",
+            "Received ASR request source_file=%s upload_file=%s size=%s language=%s diarize=%s prompt=%s hotwords=%s",
             tmp_path.name,
+            upload_path.name,
             file_size,
             language,
             diarize_flag,
@@ -593,13 +644,13 @@ async def asr(
         )
 
         if file_size < SMALL_FILE_THRESHOLD_BYTES:
-            audio_url = xf_client.upload_small_file(tmp_path, request_id)
+            audio_url = xf_client.upload_small_file(upload_path, request_id)
         else:
-            audio_url = xf_client.upload_large_file(tmp_path, request_id)
+            audio_url = xf_client.upload_large_file(upload_path, request_id)
 
         task_id = xf_client.create_task(
             audio_url=audio_url,
-            file_path=tmp_path,
+            file_path=upload_path,
             request_id=request_id,
             language=normalize_language(language),
             diarize=diarize_flag,
@@ -650,7 +701,10 @@ async def asr(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         try:
-            if tmp_path and DELETE_TEMP_FILE and tmp_path.exists():
-                tmp_path.unlink()
+            if DELETE_TEMP_FILE:
+                if upload_path and upload_path != tmp_path and upload_path.exists():
+                    upload_path.unlink()
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink()
         except Exception:
-            logger.warning("Failed to delete temp file %s", tmp_path, exc_info=True)
+            logger.warning("Failed to delete temp files source=%s upload=%s", tmp_path, upload_path, exc_info=True)
