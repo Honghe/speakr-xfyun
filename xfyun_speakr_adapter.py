@@ -145,19 +145,34 @@ class XFYunClient:
         return self._parse_response(resp, url)
 
     def _parse_response(self, resp: httpx.Response, url: str) -> Dict[str, Any]:
+        data: Optional[Dict[str, Any]] = None
         try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            text = exc.response.text
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            parsed = None
+
+        if resp.is_error:
+            if data is not None:
+                code = data.get("code")
+                message = data.get("message")
+                raise XFYunAPIError(
+                    f"HTTP {resp.status_code} calling {url}: code={code}, message={message}",
+                    status_code=resp.status_code,
+                    payload=data,
+                )
             raise XFYunAPIError(
-                f"HTTP {exc.response.status_code} calling {url}: {text}",
-                status_code=exc.response.status_code,
-                payload=text,
-            ) from exc
-        try:
-            data = resp.json()
-        except Exception as exc:
-            raise XFYunAPIError(f"Non-JSON response from {url}: {resp.text[:500]}") from exc
+                f"HTTP {resp.status_code} calling {url}: {resp.text[:500]}",
+                status_code=resp.status_code,
+                payload=resp.text,
+            )
+
+        if data is None:
+            try:
+                data = resp.json()
+            except Exception as exc:
+                raise XFYunAPIError(f"Non-JSON response from {url}: {resp.text[:500]}") from exc
         code = data.get("code")
         if code != 0:
             raise XFYunAPIError(
@@ -280,6 +295,45 @@ class XFYunClient:
     def query_task(self, task_id: str) -> Dict[str, Any]:
         payload = {"common": {"app_id": self.app_id}, "business": {"task_id": task_id}}
         return self._post_json(f"{OST_BASE}/v2/ost/query", payload)
+
+
+XFYUN_ERROR_HINTS = {
+    10107: "Invalid XFYun encoding parameter.",
+    10303: "XFYun rejected one or more request parameters.",
+    10043: "XFYun could not decode the audio with the declared encoding.",
+    20304: "XFYun rejected the audio as silence or as a format mismatch. This API expects 16kHz, 16-bit, mono audio; wav/pcm should use encoding=raw and mp3 should use encoding=lame.",
+}
+
+XFYUN_CLIENT_ERROR_CODES = set(XFYUN_ERROR_HINTS)
+
+
+def get_xfyun_error_code(payload: Any) -> Optional[int]:
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def build_xfyun_error_message(exc: XFYunAPIError) -> str:
+    code = get_xfyun_error_code(exc.payload)
+    if code is None:
+        return str(exc)
+
+    base = XFYUN_ERROR_HINTS.get(code)
+    if not base:
+        return str(exc)
+
+    payload = exc.payload if isinstance(exc.payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    task_id = data.get("task_id")
+    task_status = data.get("task_status")
+    details: List[str] = [base, f"xfyun_code={code}"]
+    if task_id:
+        details.append(f"task_id={task_id}")
+    if task_status:
+        details.append(f"task_status={task_status}")
+    return " ".join(details)
 
 
 def flatten_lattice_to_text(lattice: List[Dict[str, Any]]) -> str:
@@ -455,7 +509,12 @@ async def asr(
 
     except XFYunAPIError as exc:
         logger.exception("XFYun API error")
-        raise HTTPException(status_code=502, detail={"message": str(exc), "payload": exc.payload}) from exc
+        xfyun_code = get_xfyun_error_code(exc.payload)
+        status_code = 422 if xfyun_code in XFYUN_CLIENT_ERROR_CODES else 502
+        raise HTTPException(
+            status_code=status_code,
+            detail={"message": build_xfyun_error_message(exc), "payload": exc.payload},
+        ) from exc
     except Exception as exc:
         logger.exception("Unexpected adapter error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
