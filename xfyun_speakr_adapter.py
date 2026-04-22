@@ -5,6 +5,8 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -85,6 +87,17 @@ PD = os.getenv("XF_PD", "")
 class SignedHeaders:
     headers: Dict[str, str]
     body: bytes
+
+
+@dataclass
+class AudioProbe:
+    format_name: Optional[str]
+    codec_name: Optional[str]
+    sample_rate: Optional[int]
+    channels: Optional[int]
+    bits_per_sample: Optional[int]
+    duration: Optional[float]
+    size: Optional[int]
 
 
 class XFYunAPIError(RuntimeError):
@@ -425,6 +438,120 @@ def save_upload_to_tmp(upload: UploadFile) -> Path:
     return target
 
 
+def probe_audio(path: Path) -> Optional[AudioProbe]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        logger.info("ffprobe not found; skipping audio probe for %s", path.name)
+        return None
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_name,sample_rate,channels,bits_per_sample:format=duration,size,format_name",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+        probe = json.loads(proc.stdout)
+        stream = ((probe.get("streams") or [None])[0]) or {}
+        fmt = probe.get("format") or {}
+        return AudioProbe(
+            format_name=fmt.get("format_name"),
+            codec_name=stream.get("codec_name"),
+            sample_rate=int(stream["sample_rate"]) if stream.get("sample_rate") else None,
+            channels=int(stream["channels"]) if stream.get("channels") else None,
+            bits_per_sample=int(stream["bits_per_sample"]) if stream.get("bits_per_sample") else None,
+            duration=float(fmt["duration"]) if fmt.get("duration") else None,
+            size=int(fmt["size"]) if fmt.get("size") else None,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out for %s", path)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        logger.warning("ffprobe failed for %s: %s", path, stderr[:500] or exc)
+    except Exception:
+        logger.warning("Unexpected ffprobe error for %s", path, exc_info=True)
+    return None
+
+
+def log_audio_probe(path: Path, probe: Optional[AudioProbe]) -> None:
+    if probe is None:
+        return
+    logger.info(
+        "Saved audio probe file=%s format=%s codec=%s sample_rate=%s channels=%s bits_per_sample=%s duration=%s size=%s",
+        path.name,
+        probe.format_name,
+        probe.codec_name,
+        probe.sample_rate,
+        probe.channels,
+        probe.bits_per_sample,
+        probe.duration,
+        probe.size,
+    )
+
+
+def validate_audio_for_xfyun(path: Path, probe: Optional[AudioProbe]) -> None:
+    if probe is None:
+        return
+
+    suffix = path.suffix.lower()
+    codec = (probe.codec_name or "").lower()
+
+    if probe.channels not in {None, 1}:
+        raise XFYunAPIError(
+            f"Unsupported audio channels for XFYun: expected mono, got {probe.channels}",
+            status_code=422,
+            payload={"channels": probe.channels, "file": path.name},
+        )
+
+    if probe.sample_rate not in {None, 16000}:
+        raise XFYunAPIError(
+            f"Unsupported audio sample rate for XFYun: expected 16000 Hz, got {probe.sample_rate} Hz",
+            status_code=422,
+            payload={"sample_rate": probe.sample_rate, "file": path.name, "codec": probe.codec_name},
+        )
+
+    if codec == "mp3":
+        if suffix != ".mp3":
+            raise XFYunAPIError(
+                f"Audio content/extension mismatch: file name ends with {suffix or '<none>'}, but actual codec is mp3",
+                status_code=422,
+                payload={"codec": probe.codec_name, "suffix": suffix, "file": path.name},
+            )
+        return
+
+    if codec.startswith("pcm_"):
+        if suffix not in {".wav", ".pcm"}:
+            raise XFYunAPIError(
+                f"Audio content/extension mismatch: file name ends with {suffix or '<none>'}, but actual codec is {probe.codec_name}",
+                status_code=422,
+                payload={"codec": probe.codec_name, "suffix": suffix, "file": path.name},
+            )
+        if probe.bits_per_sample not in {None, 16}:
+            raise XFYunAPIError(
+                f"Unsupported PCM bit depth for XFYun: expected 16-bit, got {probe.bits_per_sample}",
+                status_code=422,
+                payload={"bits_per_sample": probe.bits_per_sample, "file": path.name, "codec": probe.codec_name},
+            )
+        return
+
+    raise XFYunAPIError(
+        f"Unsupported audio codec for XFYun: {probe.codec_name or 'unknown'}",
+        status_code=422,
+        payload={
+            "codec": probe.codec_name,
+            "sample_rate": probe.sample_rate,
+            "channels": probe.channels,
+            "bits_per_sample": probe.bits_per_sample,
+            "file": path.name,
+        },
+    )
+
+
 xf_client = XFYunClient(XF_APPID, XF_API_KEY, XF_API_SECRET)
 
 
@@ -451,6 +578,9 @@ async def asr(
     request_id = uuid.uuid4().hex
     try:
         tmp_path = save_upload_to_tmp(audio_file)
+        probe = probe_audio(tmp_path)
+        log_audio_probe(tmp_path, probe)
+        validate_audio_for_xfyun(tmp_path, probe)
         file_size = tmp_path.stat().st_size
         logger.info(
             "Received ASR request file=%s size=%s language=%s diarize=%s prompt=%s hotwords=%s",
@@ -510,7 +640,7 @@ async def asr(
     except XFYunAPIError as exc:
         logger.exception("XFYun API error")
         xfyun_code = get_xfyun_error_code(exc.payload)
-        status_code = 422 if xfyun_code in XFYUN_CLIENT_ERROR_CODES else 502
+        status_code = exc.status_code or (422 if xfyun_code in XFYUN_CLIENT_ERROR_CODES else 502)
         raise HTTPException(
             status_code=status_code,
             detail={"message": build_xfyun_error_message(exc), "payload": exc.payload},
